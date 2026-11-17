@@ -13,6 +13,16 @@
 #include <algorithm>
 #include <cstring>
 #include <map>
+#include <set>
+
+// Live battery reads over GATT need bluetoothleapis.h (MinGW-w64 ships it). Without it the build still
+// works, it just keeps using the level Windows has cached.
+#if defined(__has_include)
+#if __has_include(<bluetoothleapis.h>)
+#include <bluetoothleapis.h>
+#define HAVE_BLE_GATT 1
+#endif
+#endif
 
 namespace {
 
@@ -105,6 +115,117 @@ std::wstring ContainerOf(const std::wstring& path) {
 }
 std::wstring HidContainer(const std::wstring& path) { return ContainerOf(path); }
 
+#ifdef HAVE_BLE_GATT
+// ---- live Battery Level over GATT ------------------------------------------------------------------
+// For a Bluetooth LE device Windows keeps the Battery Level it last read in a device property. Dual-mode
+// headphones (a classic audio link plus an LE link that nobody keeps open) can leave that property hours
+// out of date: the Audio-Technica ATH-M50xBT2 showed 50% in Settings while the headphones were at 65%.
+// Where the device has the standard Battery Service (0x180F), ask it directly: reading the Battery Level
+// characteristic (0x2A19) with FORCE_READ_FROM_DEVICE makes Windows connect and fetch the live value.
+// Read-only, like every driver here.
+
+const GUID kGattServiceInterface = { 0x6E3BB679, 0x4372, 0x40C8, { 0x9E, 0xAA, 0x45, 0x09, 0xDF, 0x26, 0x0C, 0xD8 } };
+const ULONG kForceReadFromDevice = 0x00000004;  // BLUETOOTH_GATT_FLAG_FORCE_READ_FROM_DEVICE
+
+typedef HRESULT(WINAPI* GetCharacteristicsFn)(HANDLE, PBTH_LE_GATT_SERVICE, USHORT, PBTH_LE_GATT_CHARACTERISTIC, USHORT*, ULONG);
+typedef HRESULT(WINAPI* GetCharacteristicValueFn)(HANDLE, PBTH_LE_GATT_CHARACTERISTIC, ULONG, PBTH_LE_GATT_CHARACTERISTIC_VALUE, USHORT*, ULONG);
+
+// Device interface path of the GATT service node `dd` (BTHLEDEVICE\{0000180F-...}), or "".
+std::wstring GattServicePath(HDEVINFO di, SP_DEVINFO_DATA* dd) {
+    SP_DEVICE_INTERFACE_DATA ifd{ sizeof(ifd) };
+    if (!SetupDiEnumDeviceInterfaces(di, dd, &kGattServiceInterface, 0, &ifd)) return L"";
+    DWORD need = 0;
+    SetupDiGetDeviceInterfaceDetailW(di, &ifd, nullptr, 0, &need, nullptr);
+    if (!need) return L"";
+    std::vector<BYTE> buf(need);
+    auto det = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buf.data());
+    det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+    if (!SetupDiGetDeviceInterfaceDetailW(di, &ifd, det, need, nullptr, nullptr)) return L"";
+    return det->DevicePath;
+}
+
+struct GattJob {
+    std::wstring path;
+    int level = -1;         // 0..100 once read
+    wchar_t why[64] = L"";  // what went wrong, for the tooltip and --list
+};
+volatile LONG g_gattBusy = 0;  // 1 while a read thread is alive (one that times out can outlive its caller)
+std::map<std::wstring, int> g_lastLive;  // container id -> last level read live, kept for when a read fails
+
+int ReadGattBatteryLevel(const std::wstring& path, wchar_t (&why)[64]) {
+    HMODULE lib = LoadLibraryW(L"BluetoothApis.dll");
+    if (!lib) { swprintf(why, 64, L"BluetoothApis.dll missing"); return -1; }
+    auto getChars = (GetCharacteristicsFn)(void*)GetProcAddress(lib, "BluetoothGATTGetCharacteristics");
+    auto getValue = (GetCharacteristicValueFn)(void*)GetProcAddress(lib, "BluetoothGATTGetCharacteristicValue");
+    if (!getChars || !getValue) { swprintf(why, 64, L"GATT API missing"); return -1; }
+
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) { swprintf(why, 64, L"open failed (%lu)", (unsigned long)GetLastError()); return -1; }
+
+    int level = -1;
+    USHORT count = 0;
+    getChars(h, nullptr, 0, nullptr, &count, 0);  // first call only reports how many there are
+    if (count == 0 || count > 32) {
+        swprintf(why, 64, L"no characteristics (%u)", (unsigned)count);
+    } else {
+        std::vector<BTH_LE_GATT_CHARACTERISTIC> chars(count);
+        USHORT got = 0;
+        HRESULT hr = getChars(h, nullptr, count, chars.data(), &got, 0);
+        if (FAILED(hr)) {
+            swprintf(why, 64, L"characteristics 0x%08lX", (unsigned long)hr);
+        } else {
+            bool found = false;
+            for (USHORT i = 0; i < got && !found; i++) {
+                BTH_LE_GATT_CHARACTERISTIC& c = chars[i];
+                if (!c.CharacteristicUuid.IsShortUuid || c.CharacteristicUuid.Value.ShortUuid != 0x2A19) continue;
+                found = true;
+                alignas(8) BYTE buf[64] = {};
+                auto val = reinterpret_cast<PBTH_LE_GATT_CHARACTERISTIC_VALUE>(buf);
+                USHORT need = 0;
+                hr = getValue(h, &c, sizeof(buf), val, &need, kForceReadFromDevice);
+                if (FAILED(hr)) swprintf(why, 64, L"read 0x%08lX", (unsigned long)hr);
+                else if (val->DataSize < 1 || val->Data[0] > 100) swprintf(why, 64, L"odd value");
+                else level = val->Data[0];
+            }
+            if (!found) swprintf(why, 64, L"no battery level characteristic");
+        }
+    }
+    CloseHandle(h);
+    return level;
+}
+
+DWORD WINAPI GattBatteryThread(LPVOID param) {
+    auto job = static_cast<GattJob*>(param);
+    job->level = ReadGattBatteryLevel(job->path, job->why);
+    InterlockedExchange(&g_gattBusy, 0);
+    return 0;
+}
+
+// Runs the read on its own thread so an unreachable device cannot hold up the whole poll: after the timeout
+// the pending call is cancelled. Returns -1 on failure and puts the reason in `why`.
+int LiveGattBattery(const std::wstring& path, std::wstring& why) {
+    if (InterlockedCompareExchange(&g_gattBusy, 1, 0) != 0) { why = L"previous read still pending"; return -1; }
+    auto job = new GattJob{ path };
+    HANDLE th = CreateThread(nullptr, 0, GattBatteryThread, job, 0, nullptr);
+    if (!th) { InterlockedExchange(&g_gattBusy, 0); delete job; why = L"could not start thread"; return -1; }
+    if (WaitForSingleObject(th, 5000) != WAIT_OBJECT_0) {
+        CancelSynchronousIo(th);
+        if (WaitForSingleObject(th, 500) != WAIT_OBJECT_0) {
+            CloseHandle(th);  // the thread still owns `job`; it is left alone (tiny, rare leak)
+            why = L"timed out";
+            return -1;
+        }
+    }
+    CloseHandle(th);
+    int level = job->level;
+    why = job->why;
+    delete job;
+    return level;
+}
+#endif  // HAVE_BLE_GATT
+
 }  // namespace
 
 void PollGenericHid(PollContext& ctx) {
@@ -177,6 +298,9 @@ void PollBluetooth(PollContext& ctx) {
     std::map<std::wstring, std::wstring> containerCat;   // container id -> device container category
     std::map<std::wstring, bool> containerConn;          // container id -> main BT device node connected
     std::map<std::wstring, Found> battery;
+    std::set<std::wstring> classicConn;                  // containers whose classic (BTHENUM) node is connected
+    std::map<std::wstring, bool> batteryFromLe;          // container id -> the level above sits on an LE node
+    std::map<std::wstring, std::wstring> gattBatteryPath;  // container id -> interface path of its 0x180F node
     SP_DEVINFO_DATA dd{ sizeof(dd) };
     for (DWORD i = 0; SetupDiEnumDeviceInfo(di, i, &dd); i++) {
         wchar_t inst[512];
@@ -208,8 +332,18 @@ void PollBluetooth(PollContext& ctx) {
                 // The device is connected when either node is, whichever one is enumerated last.
                 bool& c = containerConn[cid];
                 c = c || conn != DEVPROP_FALSE;
+                if (!wcsncmp(inst, L"BTHENUM\\DEV_", 12) && conn != DEVPROP_FALSE) classicConn.insert(cid);
             }
         }
+#ifdef HAVE_BLE_GATT
+        {
+            static const wchar_t kBatteryService[] = L"BTHLEDEVICE\\{0000180F-";
+            if (!_wcsnicmp(inst, kBatteryService, wcslen(kBatteryService))) {
+                std::wstring gp = GattServicePath(di, &dd);
+                if (!gp.empty()) gattBatteryPath[cid] = gp;
+            }
+        }
+#endif
 
         BYTE pct = 0;
         if (!SetupDiGetDevicePropertyW(di, &dd, &kBtBattery, &t, &pct, sizeof(pct), nullptr, 0) || t != DEVPROP_TYPE_BYTE) continue;
@@ -226,6 +360,7 @@ void PollBluetooth(PollContext& ctx) {
         auto prev = battery.find(cid);
         if (prev != battery.end() && prev->second.connected && conn == DEVPROP_FALSE) continue;  // prefer a live node
         battery[cid] = { pct, StripServiceSuffix(name), conn != DEVPROP_FALSE };
+        batteryFromLe[cid] = !wcsncmp(inst, L"BTHLE", 5);  // BTHLE\\ and BTHLEDEVICE\\ nodes
     }
     SetupDiDestroyDeviceInfoList(di);
 
@@ -257,6 +392,27 @@ void PollBluetooth(PollContext& ctx) {
         if (dup) continue;
         s.via = L"Bluetooth";
         s.percent = f.pct;
+#ifdef HAVE_BLE_GATT
+        // Dual-mode headphones: classic audio link up, level taken from an LE node Windows may not have
+        // refreshed for hours. Ask the Battery Service itself (see LiveGattBattery).
+        {
+            auto gp = gattBatteryPath.find(cid);
+            auto le = batteryFromLe.find(cid);
+            if (gp != gattBatteryPath.end() && le != batteryFromLe.end() && le->second && classicConn.count(cid)) {
+                std::wstring why;
+                int live = LiveGattBattery(gp->second, why);
+                if (live >= 0) {
+                    s.percent = live;
+                    g_lastLive[cid] = live;
+                    s.detail = L"read live from the device";
+                } else {
+                    auto last = g_lastLive.find(cid);
+                    if (last != g_lastLive.end()) s.percent = last->second;
+                    s.detail = L"live read failed (" + why + L"), Windows' own value may be old";
+                }
+            }
+        }
+#endif
         auto cod = containerCod.find(cid);
         s.kind = cod != containerCod.end() ? KindFromClassOfDevice(cod->second) : DeviceKind::Other;
         if (s.kind == DeviceKind::Other) {

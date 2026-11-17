@@ -8,6 +8,7 @@
 
 #include <commctrl.h>
 #include <setupapi.h>
+#include <cfgmgr32.h>
 #include <winhttp.h>
 
 #include <algorithm>
@@ -29,6 +30,26 @@ const wchar_t kRequestedPage[] = L"krisgfx.com/tools/#requested";
 const DEVPROPKEY kBusReportedDesc = { { 0x540B947E, 0x8B40, 0x45BC, { 0xA8, 0xA2, 0x6A, 0x0B, 0x89, 0x4C, 0xBD, 0xA2 } }, 4 };
 const DEVPROPKEY kBtBattery = { { 0x104EA319, 0x6EE2, 0x4701, { 0xBD, 0x47, 0x8D, 0xDB, 0xF4, 0x25, 0xBB, 0xE5 } }, 2 };
 const GUID kBluetoothClass = { 0xE0CBF06C, 0xCD8B, 0x4647, { 0xBB, 0x8A, 0x26, 0x3B, 0x43, 0xF0, 0xF9, 0x74 } };
+// DEVPKEY_Device_ContainerId and the "is connected" property, spelled out here because this file does not
+// define INITGUID (the same values PollBluetooth in drivers/generic.cpp uses).
+const DEVPROPKEY kContainerId = { { 0x8C7ED206, 0x3F8A, 0x4827, { 0xB3, 0xAB, 0xAE, 0x9E, 0x1F, 0xAE, 0xFC, 0x6C } }, 2 };
+const DEVPROPKEY kIsConnectedProp = { { 0x83DA6326, 0x97A6, 0x4088, { 0x94, 0x53, 0xA1, 0x92, 0x3F, 0x57, 0x3B, 0x29 } }, 15 };
+
+// Replaces anything that looks like a Bluetooth address (12 hex digits) with X, so a dump can be pasted in
+// a public issue. The tail of a service GUID ("...-00805F9B34FB") is not an address and stays readable.
+std::wstring MaskAddresses(std::wstring s) {
+    for (size_t i = 0; i + 12 <= s.size();) {
+        bool run = i == 0 || (s[i - 1] != L'-' && !iswxdigit(s[i - 1]));
+        for (size_t k = 0; run && k < 12; k++) run = iswxdigit(s[i + k]) != 0;
+        if (run && (i + 12 == s.size() || !iswxdigit(s[i + 12]))) {
+            for (size_t k = 0; k < 12; k++) s[i + k] = L'X';
+            i += 12;
+        } else {
+            i++;
+        }
+    }
+    return s;
+}
 
 // ---- device scan --------------------------------------------------------------------------------
 
@@ -718,6 +739,47 @@ std::wstring DumpExtras() {
             out += L"  " + name + (battery ? L"  (battery reported by Windows: " + std::to_wstring(level) + L"%)" : L"") + L"\n";
         }
         SetupDiDestroyDeviceInfoList(di);
+    }
+
+    // The same scan PollBluetooth does, node by node: which node of a device holds the battery level, and
+    // which flag (connected, problem code) could make the driver skip it. Nodes with the same container
+    // belong to one physical device. Bluetooth addresses are masked.
+    out += L"\nBluetooth nodes (instance id | container | name | battery | connected | problem):\n";
+    HDEVINFO all = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
+    if (all != INVALID_HANDLE_VALUE) {
+        SP_DEVINFO_DATA nd{ sizeof(nd) };
+        for (DWORD i = 0; SetupDiEnumDeviceInfo(all, i, &nd); i++) {
+            wchar_t idBuf[512] = {};
+            if (!SetupDiGetDeviceInstanceIdW(all, &nd, idBuf, 511, nullptr)) continue;
+            if (wcsncmp(idBuf, L"BTHENUM\\", 8) && wcsncmp(idBuf, L"BTHLE\\", 6) && wcsncmp(idBuf, L"BTHLEDEVICE\\", 12)) continue;
+
+            GUID container{};
+            DEVPROPTYPE type = 0;
+            wchar_t cont[16] = L"--------";
+            if (SetupDiGetDevicePropertyW(all, &nd, &kContainerId, &type, (PBYTE)&container, sizeof(container), nullptr, 0) &&
+                type == DEVPROP_TYPE_GUID)
+                swprintf(cont, 16, L"%08lX", (unsigned long)container.Data1);
+
+            BYTE level = 0;
+            std::wstring battery = L"none";
+            if (SetupDiGetDevicePropertyW(all, &nd, &kBtBattery, &type, &level, sizeof(level), nullptr, 0) && type == DEVPROP_TYPE_BYTE)
+                battery = std::to_wstring(level) + L"%";
+
+            DEVPROP_BOOLEAN conn = DEVPROP_FALSE;
+            std::wstring connected = L"n/a";
+            if (SetupDiGetDevicePropertyW(all, &nd, &kIsConnectedProp, &type, (PBYTE)&conn, sizeof(conn), nullptr, 0) &&
+                type == DEVPROP_TYPE_BOOLEAN)
+                connected = conn != DEVPROP_FALSE ? L"yes" : L"no";
+
+            ULONG status = 0, problem = 0;
+            std::wstring prob = L"?";
+            if (CM_Get_DevNode_Status(&status, &problem, nd.DevInst, 0) == CR_SUCCESS)
+                prob = (status & DN_HAS_PROBLEM) ? std::to_wstring(problem) : L"0";
+
+            out += L"  " + MaskAddresses(idBuf) + L" | " + cont + L" | " + DeviceName(all, nd) + L" | " + battery + L" | " + connected +
+                   L" | " + prob + L"\n";
+        }
+        SetupDiDestroyDeviceInfoList(all);
     }
     return out;
 }

@@ -202,8 +202,13 @@ void PollBluetooth(PollContext& ctx) {
             if (!cat.empty()) containerCat[cid] = cat;
             DEVPROP_BOOLEAN conn;
             if (SetupDiGetDevicePropertyW(di, &dd, &kIsConnected, &t, (PBYTE)&conn, sizeof(conn), nullptr, 0) &&
-                t == DEVPROP_TYPE_BOOLEAN)
-                containerConn[cid] = conn != DEVPROP_FALSE;
+                t == DEVPROP_TYPE_BOOLEAN) {
+                // A dual-mode device (most Bluetooth headphones) has a classic BTHENUM node and an LE BTHLE
+                // node in the same container, and the LE one can read "disconnected" while audio plays.
+                // The device is connected when either node is, whichever one is enumerated last.
+                bool& c = containerConn[cid];
+                c = c || conn != DEVPROP_FALSE;
+            }
         }
 
         BYTE pct = 0;
@@ -244,6 +249,8 @@ void PollBluetooth(PollContext& ctx) {
         auto it = containerName.find(cid);
         s.name = (it != containerName.end() && !it->second.empty()) ? it->second : f.name;
         if (s.name.empty()) s.name = L"Bluetooth device";
+        // Dual-mode headphones advertise over LE as "LE_<name>" (Sony, Audio-Technica ...); show the real name.
+        if (s.name.size() > 3 && s.name.compare(0, 3, L"LE_") == 0) s.name.erase(0, 3);
         // Skip devices a vendor driver already reported over HID++ / Bragi on the same link.
         bool dup = false;
         for (auto& o : ctx.out) dup |= o.name == s.name;

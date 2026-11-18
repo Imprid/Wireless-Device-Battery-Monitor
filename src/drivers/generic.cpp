@@ -225,15 +225,16 @@ int ReadLevelFrom(HANDLE h, PBTH_LE_GATT_SERVICE svc, GetCharacteristicsFn getCh
 
 struct GattJob {
     std::wstring servicePath, devicePath;
-    int level = -1;  // 0..100 once read
-    std::wstring why;  // what went wrong, for the tooltip and --dump
+    int level = -1;     // 0..100 once read
+    std::wstring why;   // what went wrong, for --dump
+    std::wstring route; // which of the two routes below worked
 };
 volatile LONG g_gattBusy = 0;  // 1 while a read thread is alive (one that times out can outlive its caller)
 std::map<std::wstring, int> g_lastLive;  // container id -> last level read live, kept for when a read fails
 
 // Two routes to the same characteristic: the Battery Service node's own handle, then the LE device's handle
 // (which lists its services itself; this is the route Microsoft's GATT samples take).
-int ReadGattBatteryLevel(const GattJob& job, std::wstring& why) {
+int ReadGattBatteryLevel(GattJob& job, std::wstring& why) {
     HMODULE lib = LoadLibraryW(L"BluetoothApis.dll");
     if (!lib) { why = L"BluetoothApis.dll missing"; return -1; }
     auto getServices = (GetServicesFn)(void*)GetProcAddress(lib, "BluetoothGATTGetServices");
@@ -250,7 +251,10 @@ int ReadGattBatteryLevel(const GattJob& job, std::wstring& why) {
             std::wstring sub;
             int level = ReadLevelFrom(h, nullptr, getChars, getValue, sub);
             CloseHandle(h);
-            if (level >= 0) return level;
+            if (level >= 0) {
+                job.route = L"the service node";
+                return level;
+            }
             why += L"service node: " + sub + L"; ";
         }
     }
@@ -285,6 +289,7 @@ int ReadGattBatteryLevel(const GattJob& job, std::wstring& why) {
             }
         }
         CloseHandle(h);
+        if (level >= 0) job.route = L"the device handle";
         return level;
     }
     return -1;
@@ -298,13 +303,14 @@ DWORD WINAPI GattBatteryThread(LPVOID param) {
 }
 
 // Runs the read on its own thread so an unreachable device cannot hold up the whole poll: after the timeout
-// the pending call is cancelled. Returns -1 on failure and puts the reason in `why`.
-int LiveGattBattery(const std::wstring& servicePath, const std::wstring& devicePath, std::wstring& why) {
+// the pending call is cancelled. A read normally takes about a second. Returns -1 on failure and puts the
+// reason in `why`; on success `route` says which route worked.
+int LiveGattBattery(const std::wstring& servicePath, const std::wstring& devicePath, std::wstring& why, std::wstring& route) {
     if (InterlockedCompareExchange(&g_gattBusy, 1, 0) != 0) { why = L"previous read still pending"; return -1; }
     auto job = new GattJob{ servicePath, devicePath };
     HANDLE th = CreateThread(nullptr, 0, GattBatteryThread, job, 0, nullptr);
     if (!th) { InterlockedExchange(&g_gattBusy, 0); delete job; why = L"could not start thread"; return -1; }
-    if (WaitForSingleObject(th, 8000) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(th, 4000) != WAIT_OBJECT_0) {
         CancelSynchronousIo(th);
         if (WaitForSingleObject(th, 500) != WAIT_OBJECT_0) {
             CloseHandle(th);  // the thread still owns `job`; it is left alone (tiny, rare leak)
@@ -315,6 +321,7 @@ int LiveGattBattery(const std::wstring& servicePath, const std::wstring& deviceP
     CloseHandle(th);
     int level = job->level;
     why = job->why;
+    route = job->route;
     delete job;
     return level;
 }
@@ -506,19 +513,19 @@ void PollBluetooth(PollContext& ctx) {
             BtDiag(tag + L": level from an LE node " + YesNo(leLevel) + L", classic node connected " + YesNo(classic) +
                    L", Battery Service node " + (haveNode ? L"found" : L"missing"));
             if (haveNode && leLevel && classic) {
-                std::wstring why;
+                std::wstring why, route;
                 const ULONGLONG t0 = GetTickCount64();
-                int live = LiveGattBattery(gp->second, dp != gattDevicePath.end() ? dp->second : std::wstring(), why);
+                int live = LiveGattBattery(gp->second, dp != gattDevicePath.end() ? dp->second : std::wstring(), why, route);
                 const std::wstring took = std::to_wstring((unsigned long long)(GetTickCount64() - t0)) + L" ms";
                 if (live >= 0) {
                     s.percent = live;
                     g_lastLive[cid] = live;
-                    s.detail = L"read live from the device";
-                    BtDiag(L"live read OK: " + std::to_wstring(live) + L"% after " + took);
+                    BtDiag(L"live read OK: " + std::to_wstring(live) + L"% via " + route + L" after " + took);
                 } else {
+                    // Keep the last live reading rather than falling back to Windows' older cached level.
                     auto last = g_lastLive.find(cid);
                     if (last != g_lastLive.end()) s.percent = last->second;
-                    s.detail = L"live read failed (" + why + L"), Windows' own value may be old";
+                    s.detail = last != g_lastLive.end() ? L"last known level" : L"level cached by Windows";
                     BtDiag(L"live read FAILED: " + why + L" after " + took);
                 }
             } else {

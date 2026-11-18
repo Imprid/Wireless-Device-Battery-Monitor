@@ -134,93 +134,177 @@ std::wstring ShortId(const std::wstring& cid) {
 // characteristic (0x2A19) with FORCE_READ_FROM_DEVICE makes Windows connect and fetch the live value.
 // Read-only, like every driver here.
 
+// GUID_BLUETOOTH_GATT_SERVICE_DEVICE_INTERFACE (the interface of a BTHLEDEVICE\{service uuid} node) and
+// GUID_BLUETOOTHLE_DEVICE_INTERFACE (the interface of a BTHLE\DEV_ node).
 const GUID kGattServiceInterface = { 0x6E3BB679, 0x4372, 0x40C8, { 0x9E, 0xAA, 0x45, 0x09, 0xDF, 0x26, 0x0C, 0xD8 } };
+const GUID kGattDeviceInterface = { 0x781AEE18, 0x7733, 0x4CE4, { 0xAD, 0xD0, 0x91, 0xF4, 0x1C, 0x67, 0xB5, 0x92 } };
 const ULONG kForceReadFromDevice = 0x00000004;  // BLUETOOTH_GATT_FLAG_FORCE_READ_FROM_DEVICE
 
+typedef HRESULT(WINAPI* GetServicesFn)(HANDLE, USHORT, PBTH_LE_GATT_SERVICE, USHORT*, ULONG);
 typedef HRESULT(WINAPI* GetCharacteristicsFn)(HANDLE, PBTH_LE_GATT_SERVICE, USHORT, PBTH_LE_GATT_CHARACTERISTIC, USHORT*, ULONG);
 typedef HRESULT(WINAPI* GetCharacteristicValueFn)(HANDLE, PBTH_LE_GATT_CHARACTERISTIC, ULONG, PBTH_LE_GATT_CHARACTERISTIC_VALUE, USHORT*, ULONG);
 
-// Device interface path of the GATT service node `dd` (BTHLEDEVICE\{0000180F-...}), or "".
-std::wstring GattServicePath(HDEVINFO di, SP_DEVINFO_DATA* dd) {
-    SP_DEVICE_INTERFACE_DATA ifd{ sizeof(ifd) };
-    if (!SetupDiEnumDeviceInterfaces(di, dd, &kGattServiceInterface, 0, &ifd)) return L"";
-    DWORD need = 0;
-    SetupDiGetDeviceInterfaceDetailW(di, &ifd, nullptr, 0, &need, nullptr);
-    if (!need) return L"";
-    std::vector<BYTE> buf(need);
-    auto det = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buf.data());
-    det->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
-    if (!SetupDiGetDeviceInterfaceDetailW(di, &ifd, det, need, nullptr, nullptr)) return L"";
-    return det->DevicePath;
+// Device interface path of the node `inst` for interface `guid`. Asks the configuration manager first; if
+// that has nothing it builds the path, which is always "\\?\" + the instance id with \ turned into # + #
+// + the interface guid. `how` says which of the two it was.
+std::wstring InterfacePath(const wchar_t* inst, const GUID& guid, const wchar_t** how) {
+    GUID g = guid;
+    ULONG len = 0;
+    if (CM_Get_Device_Interface_List_SizeW(&len, &g, const_cast<wchar_t*>(inst), CM_GET_DEVICE_INTERFACE_LIST_PRESENT) == CR_SUCCESS &&
+        len > 1) {
+        std::vector<wchar_t> buf(len + 1, 0);
+        if (CM_Get_Device_Interface_ListW(&g, const_cast<wchar_t*>(inst), buf.data(), len, CM_GET_DEVICE_INTERFACE_LIST_PRESENT) ==
+                CR_SUCCESS &&
+            buf[0]) {
+            *how = L"from the configuration manager";
+            return buf.data();
+        }
+    }
+    std::wstring p = L"\\\\?\\";
+    for (const wchar_t* c = inst; *c; ++c) p += (*c == L'\\') ? L'#' : *c;
+    wchar_t gs[64] = {};
+    StringFromGUID2(g, gs, 64);
+    p += L"#";
+    p += gs;
+    *how = L"built from the instance id";
+    return p;
+}
+
+std::wstring Hex(HRESULT hr) {
+    wchar_t b[16];
+    swprintf(b, 16, L"0x%08lX", (unsigned long)hr);
+    return b;
+}
+
+// GATT handles want read+write access; plain read is only a fallback. *err keeps the first failure.
+HANDLE OpenGatt(const std::wstring& path, DWORD* err) {
+    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) {
+        *err = GetLastError();
+        h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
+    }
+    return h;
+}
+
+// Reads Battery Level (0x2A19) through an open handle. `svc` is the Battery Service when `h` is a device
+// handle, and null when `h` is the service node's own handle. Returns 0..100, or -1 with the reason in `why`.
+int ReadLevelFrom(HANDLE h, PBTH_LE_GATT_SERVICE svc, GetCharacteristicsFn getChars, GetCharacteristicValueFn getValue, std::wstring& why) {
+    USHORT count = 0;
+    getChars(h, svc, 0, nullptr, &count, 0);  // first call only reports how many there are
+    if (count == 0 || count > 32) {
+        why += L"no characteristics (" + std::to_wstring((unsigned)count) + L")";
+        return -1;
+    }
+    std::vector<BTH_LE_GATT_CHARACTERISTIC> chars(count);
+    USHORT got = 0;
+    HRESULT hr = getChars(h, svc, count, chars.data(), &got, 0);
+    if (FAILED(hr)) {
+        why += L"characteristics " + Hex(hr);
+        return -1;
+    }
+    for (USHORT i = 0; i < got; i++) {
+        BTH_LE_GATT_CHARACTERISTIC& c = chars[i];
+        if (!c.CharacteristicUuid.IsShortUuid || c.CharacteristicUuid.Value.ShortUuid != 0x2A19) continue;
+        alignas(8) BYTE buf[64] = {};
+        auto val = reinterpret_cast<PBTH_LE_GATT_CHARACTERISTIC_VALUE>(buf);
+        USHORT need = 0;
+        hr = getValue(h, &c, sizeof(buf), val, &need, kForceReadFromDevice);
+        if (FAILED(hr)) {
+            why += L"read " + Hex(hr);
+            return -1;
+        }
+        if (val->DataSize < 1 || val->Data[0] > 100) {
+            why += L"odd value";
+            return -1;
+        }
+        return val->Data[0];
+    }
+    why += L"no battery level characteristic";
+    return -1;
 }
 
 struct GattJob {
-    std::wstring path;
-    int level = -1;         // 0..100 once read
-    wchar_t why[64] = L"";  // what went wrong, for the tooltip and --list
+    std::wstring servicePath, devicePath;
+    int level = -1;  // 0..100 once read
+    std::wstring why;  // what went wrong, for the tooltip and --dump
 };
 volatile LONG g_gattBusy = 0;  // 1 while a read thread is alive (one that times out can outlive its caller)
 std::map<std::wstring, int> g_lastLive;  // container id -> last level read live, kept for when a read fails
 
-int ReadGattBatteryLevel(const std::wstring& path, wchar_t (&why)[64]) {
+// Two routes to the same characteristic: the Battery Service node's own handle, then the LE device's handle
+// (which lists its services itself; this is the route Microsoft's GATT samples take).
+int ReadGattBatteryLevel(const GattJob& job, std::wstring& why) {
     HMODULE lib = LoadLibraryW(L"BluetoothApis.dll");
-    if (!lib) { swprintf(why, 64, L"BluetoothApis.dll missing"); return -1; }
+    if (!lib) { why = L"BluetoothApis.dll missing"; return -1; }
+    auto getServices = (GetServicesFn)(void*)GetProcAddress(lib, "BluetoothGATTGetServices");
     auto getChars = (GetCharacteristicsFn)(void*)GetProcAddress(lib, "BluetoothGATTGetCharacteristics");
     auto getValue = (GetCharacteristicValueFn)(void*)GetProcAddress(lib, "BluetoothGATTGetCharacteristicValue");
-    if (!getChars || !getValue) { swprintf(why, 64, L"GATT API missing"); return -1; }
+    if (!getServices || !getChars || !getValue) { why = L"GATT API missing"; return -1; }
 
-    HANDLE h = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        h = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) { swprintf(why, 64, L"open failed (%lu)", (unsigned long)GetLastError()); return -1; }
-
-    int level = -1;
-    USHORT count = 0;
-    getChars(h, nullptr, 0, nullptr, &count, 0);  // first call only reports how many there are
-    if (count == 0 || count > 32) {
-        swprintf(why, 64, L"no characteristics (%u)", (unsigned)count);
-    } else {
-        std::vector<BTH_LE_GATT_CHARACTERISTIC> chars(count);
-        USHORT got = 0;
-        HRESULT hr = getChars(h, nullptr, count, chars.data(), &got, 0);
-        if (FAILED(hr)) {
-            swprintf(why, 64, L"characteristics 0x%08lX", (unsigned long)hr);
+    if (!job.servicePath.empty()) {
+        DWORD err = 0;
+        HANDLE h = OpenGatt(job.servicePath, &err);
+        if (h == INVALID_HANDLE_VALUE) {
+            why += L"service node: open failed (" + std::to_wstring((unsigned long)err) + L"); ";
         } else {
-            bool found = false;
-            for (USHORT i = 0; i < got && !found; i++) {
-                BTH_LE_GATT_CHARACTERISTIC& c = chars[i];
-                if (!c.CharacteristicUuid.IsShortUuid || c.CharacteristicUuid.Value.ShortUuid != 0x2A19) continue;
-                found = true;
-                alignas(8) BYTE buf[64] = {};
-                auto val = reinterpret_cast<PBTH_LE_GATT_CHARACTERISTIC_VALUE>(buf);
-                USHORT need = 0;
-                hr = getValue(h, &c, sizeof(buf), val, &need, kForceReadFromDevice);
-                if (FAILED(hr)) swprintf(why, 64, L"read 0x%08lX", (unsigned long)hr);
-                else if (val->DataSize < 1 || val->Data[0] > 100) swprintf(why, 64, L"odd value");
-                else level = val->Data[0];
-            }
-            if (!found) swprintf(why, 64, L"no battery level characteristic");
+            std::wstring sub;
+            int level = ReadLevelFrom(h, nullptr, getChars, getValue, sub);
+            CloseHandle(h);
+            if (level >= 0) return level;
+            why += L"service node: " + sub + L"; ";
         }
     }
-    CloseHandle(h);
-    return level;
+    if (!job.devicePath.empty()) {
+        DWORD err = 0;
+        HANDLE h = OpenGatt(job.devicePath, &err);
+        if (h == INVALID_HANDLE_VALUE) {
+            why += L"device: open failed (" + std::to_wstring((unsigned long)err) + L")";
+            return -1;
+        }
+        int level = -1;
+        USHORT n = 0;
+        getServices(h, 0, nullptr, &n, 0);
+        if (n == 0 || n > 64) {
+            why += L"device: no services (" + std::to_wstring((unsigned)n) + L")";
+        } else {
+            std::vector<BTH_LE_GATT_SERVICE> svcs(n);
+            USHORT got = 0;
+            HRESULT hr = getServices(h, n, svcs.data(), &got, 0);
+            if (FAILED(hr)) {
+                why += L"device: services " + Hex(hr);
+            } else {
+                bool found = false;
+                for (USHORT i = 0; i < got && !found; i++) {
+                    if (!svcs[i].ServiceUuid.IsShortUuid || svcs[i].ServiceUuid.Value.ShortUuid != 0x180F) continue;
+                    found = true;
+                    std::wstring sub;
+                    level = ReadLevelFrom(h, &svcs[i], getChars, getValue, sub);
+                    if (level < 0) why += L"device: " + sub;
+                }
+                if (!found) why += L"device: no battery service among " + std::to_wstring((unsigned)got);
+            }
+        }
+        CloseHandle(h);
+        return level;
+    }
+    return -1;
 }
 
 DWORD WINAPI GattBatteryThread(LPVOID param) {
     auto job = static_cast<GattJob*>(param);
-    job->level = ReadGattBatteryLevel(job->path, job->why);
+    job->level = ReadGattBatteryLevel(*job, job->why);
     InterlockedExchange(&g_gattBusy, 0);
     return 0;
 }
 
 // Runs the read on its own thread so an unreachable device cannot hold up the whole poll: after the timeout
 // the pending call is cancelled. Returns -1 on failure and puts the reason in `why`.
-int LiveGattBattery(const std::wstring& path, std::wstring& why) {
+int LiveGattBattery(const std::wstring& servicePath, const std::wstring& devicePath, std::wstring& why) {
     if (InterlockedCompareExchange(&g_gattBusy, 1, 0) != 0) { why = L"previous read still pending"; return -1; }
-    auto job = new GattJob{ path };
+    auto job = new GattJob{ servicePath, devicePath };
     HANDLE th = CreateThread(nullptr, 0, GattBatteryThread, job, 0, nullptr);
     if (!th) { InterlockedExchange(&g_gattBusy, 0); delete job; why = L"could not start thread"; return -1; }
-    if (WaitForSingleObject(th, 5000) != WAIT_OBJECT_0) {
+    if (WaitForSingleObject(th, 8000) != WAIT_OBJECT_0) {
         CancelSynchronousIo(th);
         if (WaitForSingleObject(th, 500) != WAIT_OBJECT_0) {
             CloseHandle(th);  // the thread still owns `job`; it is left alone (tiny, rare leak)
@@ -312,6 +396,7 @@ void PollBluetooth(PollContext& ctx) {
     std::set<std::wstring> classicConn;                  // containers whose classic (BTHENUM) node is connected
     std::map<std::wstring, bool> batteryFromLe;          // container id -> the level above sits on an LE node
     std::map<std::wstring, std::wstring> gattBatteryPath;  // container id -> interface path of its 0x180F node
+    std::map<std::wstring, std::wstring> gattDevicePath;   // container id -> interface path of its BTHLE\DEV_ node
     SP_DEVINFO_DATA dd{ sizeof(dd) };
     for (DWORD i = 0; SetupDiEnumDeviceInfo(di, i, &dd); i++) {
         wchar_t inst[512];
@@ -349,9 +434,12 @@ void PollBluetooth(PollContext& ctx) {
 #ifdef HAVE_BLE_GATT
         {
             static const wchar_t kBatteryService[] = L"BTHLEDEVICE\\{0000180F-";
+            const wchar_t* how = L"";
             if (!_wcsnicmp(inst, kBatteryService, wcslen(kBatteryService))) {
-                std::wstring gp = GattServicePath(di, &dd);
-                if (!gp.empty()) gattBatteryPath[cid] = gp;
+                gattBatteryPath[cid] = InterfacePath(inst, kGattServiceInterface, &how);
+                BtDiag(L"container " + ShortId(cid) + L": Battery Service node found, its interface path was " + how);
+            } else if (!wcsncmp(inst, L"BTHLE\\DEV_", 10)) {
+                gattDevicePath[cid] = InterfacePath(inst, kGattDeviceInterface, &how);
             }
         }
 #endif
@@ -410,6 +498,7 @@ void PollBluetooth(PollContext& ctx) {
         // refreshed for hours. Ask the Battery Service itself (see LiveGattBattery).
         {
             auto gp = gattBatteryPath.find(cid);
+            auto dp = gattDevicePath.find(cid);
             auto le = batteryFromLe.find(cid);
             const bool leLevel = le != batteryFromLe.end() && le->second;
             const bool classic = classicConn.count(cid) != 0;
@@ -419,7 +508,7 @@ void PollBluetooth(PollContext& ctx) {
             if (haveNode && leLevel && classic) {
                 std::wstring why;
                 const ULONGLONG t0 = GetTickCount64();
-                int live = LiveGattBattery(gp->second, why);
+                int live = LiveGattBattery(gp->second, dp != gattDevicePath.end() ? dp->second : std::wstring(), why);
                 const std::wstring took = std::to_wstring((unsigned long long)(GetTickCount64() - t0)) + L" ms";
                 if (live >= 0) {
                     s.percent = live;

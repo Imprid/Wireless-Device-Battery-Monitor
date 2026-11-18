@@ -103,4 +103,5 @@ void PollMoondrop(PollContext& ctx);   // MOONDROP GM01 Pro headset (WalkPlay 2.
 void PollHeadsetControl(PollContext& ctx);  // only if headsetcontrol.exe is installed
 void PollGenericHid(PollContext& ctx);
 void PollBluetooth(PollContext& ctx);
+std::wstring DiagBleBattery();  // for --dump: what PollBluetooth decided for each device with a level, and why
 void PollXInput(PollContext& ctx);

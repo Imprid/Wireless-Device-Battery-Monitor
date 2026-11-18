@@ -10,8 +10,6 @@
 #include "report.h"
 #include "hid.h"
 
-std::wstring DiagBleBattery();  // drivers/generic.cpp: --dump section for the Bluetooth fallback
-
 namespace {
 
 // HKCU\Software\WirelessBattery\IgnoreDevices (REG_SZ): "VID:PID" pairs in hex, separated by spaces,
@@ -109,7 +107,7 @@ std::vector<DeviceStatus> PollAllDevices() {
 }
 
 std::wstring DumpHidCollections() {
-    std::wstring out = L"Build: " L"" __DATE__ L" " L"" __TIME__ L"\n\nVID:PID    IF  UsagePg:Usage  In  Out Feat  Product\n";
+    std::wstring out = L"VID:PID    IF  UsagePg:Usage  In  Out Feat  Product\n";
     for (const auto& c : EnumHid()) {
         wchar_t line[160];
         swprintf(line, 160, L"%04X:%04X  %2d  %04X:%04X    %3u %3u %3u   ", c.vid, c.pid, c.iface, c.page(), c.usage(), c.inLen(), c.outLen(),

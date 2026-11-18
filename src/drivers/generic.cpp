@@ -115,6 +115,16 @@ std::wstring ContainerOf(const std::wstring& path) {
 }
 std::wstring HidContainer(const std::wstring& path) { return ContainerOf(path); }
 
+// What PollBluetooth decided for each device with a battery level, and why; printed by --dump
+// (DiagBleBattery below) so a missing or stale level can be traced without guessing.
+std::wstring g_btDiag;
+void BtDiag(const std::wstring& line) { g_btDiag += L"  " + line + L"\n"; }
+const wchar_t* YesNo(bool b) { return b ? L"yes" : L"no"; }
+std::wstring ShortId(const std::wstring& cid) {
+    size_t b = (!cid.empty() && cid[0] == L'{') ? 1 : 0;
+    return cid.substr(b, 8);
+}
+
 #ifdef HAVE_BLE_GATT
 // ---- live Battery Level over GATT ------------------------------------------------------------------
 // For a Bluetooth LE device Windows keeps the Battery Level it last read in a device property. Dual-mode
@@ -289,6 +299,7 @@ void PollGenericHid(PollContext& ctx) {
 }
 
 void PollBluetooth(PollContext& ctx) {
+    g_btDiag.clear();
     HDEVINFO di = SetupDiGetClassDevsW(nullptr, nullptr, nullptr, DIGCF_ALLCLASSES | DIGCF_PRESENT);
     if (di == INVALID_HANDLE_VALUE) return;
 
@@ -375,10 +386,12 @@ void PollBluetooth(PollContext& ctx) {
         if (ctx.IsClaimed(c.vid, c.pid)) reported.insert(cont);
     }
 
+    if (battery.empty()) BtDiag(L"no Bluetooth node carries a battery level");
     for (auto& [cid, f] : battery) {
-        if (reported.count(cid)) continue;
+        const std::wstring tag = L"container " + ShortId(cid) + L" '" + f.name + L"' (Windows level " + std::to_wstring(f.pct) + L"%)";
+        if (reported.count(cid)) { BtDiag(tag + L": skipped, a vendor driver already reported it"); continue; }
         auto mc = containerConn.find(cid);
-        if (mc != containerConn.end() ? !mc->second : !f.connected) continue;
+        if (mc != containerConn.end() ? !mc->second : !f.connected) { BtDiag(tag + L": skipped, not connected"); continue; }
         DeviceStatus s;
         s.key = L"bt:" + cid;
         auto it = containerName.find(cid);
@@ -389,7 +402,7 @@ void PollBluetooth(PollContext& ctx) {
         // Skip devices a vendor driver already reported over HID++ / Bragi on the same link.
         bool dup = false;
         for (auto& o : ctx.out) dup |= o.name == s.name;
-        if (dup) continue;
+        if (dup) { BtDiag(tag + L": skipped, a device with the same name is already listed"); continue; }
         s.via = L"Bluetooth";
         s.percent = f.pct;
 #ifdef HAVE_BLE_GATT
@@ -398,20 +411,33 @@ void PollBluetooth(PollContext& ctx) {
         {
             auto gp = gattBatteryPath.find(cid);
             auto le = batteryFromLe.find(cid);
-            if (gp != gattBatteryPath.end() && le != batteryFromLe.end() && le->second && classicConn.count(cid)) {
+            const bool leLevel = le != batteryFromLe.end() && le->second;
+            const bool classic = classicConn.count(cid) != 0;
+            const bool haveNode = gp != gattBatteryPath.end();
+            BtDiag(tag + L": level from an LE node " + YesNo(leLevel) + L", classic node connected " + YesNo(classic) +
+                   L", Battery Service node " + (haveNode ? L"found" : L"missing"));
+            if (haveNode && leLevel && classic) {
                 std::wstring why;
+                const ULONGLONG t0 = GetTickCount64();
                 int live = LiveGattBattery(gp->second, why);
+                const std::wstring took = std::to_wstring((unsigned long long)(GetTickCount64() - t0)) + L" ms";
                 if (live >= 0) {
                     s.percent = live;
                     g_lastLive[cid] = live;
                     s.detail = L"read live from the device";
+                    BtDiag(L"live read OK: " + std::to_wstring(live) + L"% after " + took);
                 } else {
                     auto last = g_lastLive.find(cid);
                     if (last != g_lastLive.end()) s.percent = last->second;
                     s.detail = L"live read failed (" + why + L"), Windows' own value may be old";
+                    BtDiag(L"live read FAILED: " + why + L" after " + took);
                 }
+            } else {
+                BtDiag(L"live read not attempted");
             }
         }
+#else
+        BtDiag(tag + L": this build has no GATT support (bluetoothleapis.h missing), showing Windows' level");
 #endif
         auto cod = containerCod.find(cid);
         s.kind = cod != containerCod.end() ? KindFromClassOfDevice(cod->second) : DeviceKind::Other;
@@ -427,4 +453,16 @@ void PollBluetooth(PollContext& ctx) {
         ctx.out.push_back(s);
         ctx.btContainers.insert(cid);
     }
+}
+
+// For --dump: runs the Bluetooth fallback once and returns what it decided and why.
+std::wstring DiagBleBattery() {
+    PollContext ctx;
+    ctx.colls = EnumHid();
+    PollBluetooth(ctx);
+    std::wstring out = L"\nBluetooth fallback (PollBluetooth) decisions:\n" + g_btDiag;
+    for (const auto& d : ctx.out)
+        out += L"  -> listed: " + d.name + L" " + std::to_wstring(d.percent) + L"%" + (d.detail.empty() ? L"" : L" (" + d.detail + L")") + L"\n";
+    if (ctx.out.empty()) out += L"  -> nothing listed\n";
+    return out;
 }
